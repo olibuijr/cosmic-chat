@@ -1,0 +1,25 @@
+[package]
+name = "cosmic-chat"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "COSMIC Chat — libcosmic IRC client"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+irc = { version = "1.0", default-features = false, features = ["tls-rust", "ctcp"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+log = "0.4"
+env_logger = "0.11"
+
+[dependencies.libcosmic]
+git = "https://github.com/pop-os/libcosmic.git"
+default-features = false
+features = ["multi-window", "tokio", "winit", "wayland", "wgpu", "about"]
+
+[profile.release]
+lto = true
+
+[workspace]

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=COSMIC Chat
+Comment=IRC client for the COSMIC desktop
+Exec=cosmic-chat
+Icon=cosmic-chat
+Type=Application
+Categories=Network;IRCClient;Chat;
+Terminal=false
+StartupNotify=true
+Keywords=irc;chat;messaging;cosmic;
