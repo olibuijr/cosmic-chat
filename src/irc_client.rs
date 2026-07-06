@@ -2,7 +2,23 @@ use futures::prelude::*;
 use irc::client::prelude::*;
 use tokio::sync::mpsc;
 
-use crate::config::ServerConfig;
+
+
+// ── Connection config (decoupled from Config) ───────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ConnectionConfig {
+    pub host: String,
+    pub port: u16,
+    pub tls: bool,
+    pub nick: String,
+    pub user: Option<String>,
+    pub realname: Option<String>,
+    pub password: Option<String>,
+    pub channels: Vec<String>,
+}
+
+// ── Messages to/from the UI ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct IrcMessage {
@@ -52,9 +68,11 @@ pub struct ServerState {
     pub current_nick: String,
 }
 
+// ── Spawn ───────────────────────────────────────────────────────────────────
+
 pub fn spawn_connection(
     idx: usize,
-    cfg: ServerConfig,
+    cfg: ConnectionConfig,
 ) -> (
     mpsc::UnboundedSender<IrcCommand>,
     mpsc::UnboundedReceiver<IrcMessage>,
@@ -73,7 +91,7 @@ pub fn spawn_connection(
 
 async fn run_connection(
     idx: usize,
-    cfg: ServerConfig,
+    cfg: ConnectionConfig,
     msg_tx: &mpsc::UnboundedSender<IrcMessage>,
     mut cmd_rx: mpsc::UnboundedReceiver<IrcCommand>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -83,7 +101,7 @@ async fn run_connection(
         realname: cfg.realname.clone(),
         server: Some(cfg.host.clone()),
         port: Some(cfg.port),
-        use_tls: Some(cfg.use_tls),
+        use_tls: Some(cfg.tls),
         password: cfg.password.clone(),
         channels: cfg.channels.clone(),
         ..Default::default()
@@ -140,6 +158,8 @@ async fn run_connection(
     let _ = msg_tx.send(server_msg(idx, "Disconnected"));
     Ok(())
 }
+
+// ── Message parsing ─────────────────────────────────────────────────────────
 
 fn parse_message(idx: usize, msg: &Message) -> Option<IrcMessage> {
     let (kind, sender, text, target) = match &msg.command {

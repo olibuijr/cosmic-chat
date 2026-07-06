@@ -6,10 +6,13 @@ use cosmic::widget::{self, nav_bar, space};
 use cosmic::Element;
 use tokio::sync::mpsc;
 
-use crate::config::{Config, ServerConfig};
+use crate::config::{Config, ServerConfig, UserProfile};
 use crate::irc_client::{
-    ConnectionState, IrcCommand, IrcMessage, MessageKind, ServerState, spawn_connection,
+    ConnectionConfig, ConnectionState, IrcCommand, IrcMessage, MessageKind, ServerState,
+    spawn_connection,
 };
+
+// ── Messages ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -37,6 +40,8 @@ enum NavItem {
     Channel(usize, String),
 }
 
+// ── Application model ───────────────────────────────────────────────────────
+
 pub struct CosmicChat {
     core: Core,
     nav: nav_bar::Model,
@@ -50,6 +55,7 @@ pub struct CosmicChat {
     context_page: ContextPage,
     dialog_server: ServerConfig,
     dialog_channels_str: String,
+    dialog_profile: String,
     dialog_show: bool,
 }
 
@@ -63,18 +69,21 @@ impl cosmic::Application for CosmicChat {
     fn core_mut(&mut self) -> &mut Core { &mut self.core }
 
     fn init(core: Core, _flags: ()) -> (Self, Task<Message>) {
-        let config = Config::load();
+        let config = Config::ensure_default();
 
         let servers: Vec<ServerState> = config
             .servers
             .iter()
             .enumerate()
-            .map(|(i, s)| ServerState {
-                idx: i,
-                name: s.name.clone(),
-                connection: ConnectionState::Disconnected,
-                channels: s.channels.clone(),
-                current_nick: s.nick.clone(),
+            .map(|(i, s)| {
+                let profile = config.resolve_profile(s);
+                ServerState {
+                    idx: i,
+                    name: s.name.clone(),
+                    connection: ConnectionState::Disconnected,
+                    channels: s.channels.clone(),
+                    current_nick: profile.nick.clone(),
+                }
             })
             .collect();
 
@@ -92,18 +101,9 @@ impl cosmic::Application for CosmicChat {
             selected: None,
             input: String::new(),
             context_page: ContextPage::About,
-            dialog_server: ServerConfig {
-                name: String::new(),
-                host: "irc.libera.chat".into(),
-                port: 6697,
-                nick: "cosmic-user".into(),
-                user: None,
-                realname: None,
-                password: None,
-                use_tls: true,
-                channels: vec!["#cosmic-chat".into()],
-            },
-            dialog_channels_str: "#cosmic-chat".into(),
+            dialog_server: ServerConfig::default(),
+            dialog_channels_str: String::new(),
+            dialog_profile: "default".into(),
             dialog_show: false,
         };
 
@@ -123,7 +123,8 @@ impl cosmic::Application for CosmicChat {
     }
 
     fn header_start(&self) -> Vec<Element<'_, Message>> {
-        let mut row = widget::row::with_capacity(3).spacing(cosmic::theme::spacing().space_xs);
+        let sp = cosmic::theme::spacing();
+        let mut row = widget::row::with_capacity(3).spacing(sp.space_xs);
 
         let (status_icon, status_text) = match &self.selected {
             Some(NavItem::Server(i)) | Some(NavItem::Channel(i, _)) => {
@@ -197,27 +198,30 @@ impl cosmic::Application for CosmicChat {
         match &self.context_page {
             ContextPage::ServerInfo(i) => {
                 let body = if let Some(s) = self.servers.get(*i) {
-                    let host = self.config.servers.get(*i).map(|c| c.host.as_str()).unwrap_or("?");
-                    let port = self.config.servers.get(*i).map(|c| c.port).unwrap_or(0);
+                    let sc = self.config.servers.get(*i);
+                    let host = sc.map(|c| c.host.as_str()).unwrap_or("?");
+                    let port = sc.map(|c| c.port).unwrap_or(0);
+                    let profile = sc.map(|c| c.profile.as_str()).unwrap_or("default");
                     widget::text::body(format!(
-                        "Server: {}\nHost: {}:{}\nNick: {}\nStatus: {:?}\nChannels: {}",
-                        s.name, host, port, s.current_nick, s.connection, s.channels.join(", "),
+                        "Server: {}\nHost: {}:{}\nNick: {}\nProfile: {}\nStatus: {:?}\nChannels: {}",
+                        s.name, host, port, s.current_nick, profile, s.connection,
+                        s.channels.join(", "),
                     ))
                 } else {
                     widget::text::body("No server selected")
                 };
 
-                Some(
-                    context_drawer::context_drawer(
-                        Element::from(body),
-                        Message::ToggleContextPage(ContextPage::ServerInfo(*i)),
-                    )
-                )
+                Some(context_drawer::context_drawer(
+                    Element::from(body),
+                    Message::ToggleContextPage(ContextPage::ServerInfo(*i)),
+                ))
             }
             ContextPage::About => {
                 let body = widget::text::body(format!(
-                    "COSMIC Chat v{}\n\nA native IRC client for the COSMIC desktop.\nBuilt with libcosmic + Rust.",
+                    "COSMIC Chat v{}\n\nA native IRC client for the COSMIC desktop.\nBuilt with libcosmic + Rust.\n\nServers: {}\nProfiles: {}",
                     env!("CARGO_PKG_VERSION"),
+                    self.config.servers.len(),
+                    self.config.profile.names().len(),
                 ));
                 Some(
                     context_drawer::context_drawer(
@@ -252,6 +256,7 @@ impl cosmic::Application for CosmicChat {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Tick => {
+                // Drain IRC messages
                 if let Some(ref mut rx) = self.msg_rx {
                     while let Ok(msg) = rx.try_recv() {
                         if msg.kind == MessageKind::Join {
@@ -266,13 +271,40 @@ impl cosmic::Application for CosmicChat {
                     }
                 }
 
-                let server_states: Vec<(usize, String)> = self.servers.iter()
+                // Auto-connect servers on first tick
+                let auto_connect: Vec<usize> = self.config
+                    .servers
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, s)| s.auto_connect && self.servers.get(*i).map_or(false, |st| st.connection == ConnectionState::Disconnected))
+                    .map(|(i, _)| i)
+                    .collect();
+
+                for idx in auto_connect {
+                    let sc = &self.config.servers[idx];
+                    let profile = self.config.resolve_profile(sc);
+                    let conn_cfg = build_connection_config(sc, profile);
+                    if let Some(s) = self.servers.get_mut(idx) {
+                        s.connection = ConnectionState::Connecting;
+                        s.current_nick = profile.nick.clone();
+                    }
+                    rebuild_nav(&mut self.nav, &self.servers);
+
+                    let (cmd_tx, msg_rx) = spawn_connection(idx, conn_cfg);
+                    self.cmd_txs.insert(idx, cmd_tx);
+                    self.msg_rx = Some(msg_rx);
+                }
+
+                // Mark servers as Connected when we see the "Connected" message
+                let server_info: Vec<(usize, String)> = self.servers.iter()
                     .map(|s| (s.idx, s.name.clone()))
                     .collect();
                 let mut need_rebuild = false;
-                for (idx, _name) in &server_states {
+                for (idx, _name) in &server_info {
                     let connected = self.messages.iter().any(|m| {
-                        m.server == *idx && m.kind == MessageKind::Server && m.text.starts_with("Connected")
+                        m.server == *idx
+                            && m.kind == MessageKind::Server
+                            && m.text.starts_with("Connected")
                     });
                     if connected {
                         if let Some(s) = self.servers.get_mut(*idx) {
@@ -322,15 +354,20 @@ impl cosmic::Application for CosmicChat {
             }
 
             Message::Connect(idx) => {
-                if let Some(s) = self.servers.get_mut(idx) {
-                    s.connection = ConnectionState::Connecting;
-                }
-                rebuild_nav(&mut self.nav, &self.servers);
+                if let Some(sc) = self.config.servers.get(idx).cloned() {
+                    let profile = self.config.resolve_profile(&sc);
+                    let conn_cfg = build_connection_config(&sc, profile);
 
-                let cfg = self.config.servers[idx].clone();
-                let (cmd_tx, msg_rx) = spawn_connection(idx, cfg);
-                self.cmd_txs.insert(idx, cmd_tx);
-                self.msg_rx = Some(msg_rx);
+                    if let Some(s) = self.servers.get_mut(idx) {
+                        s.connection = ConnectionState::Connecting;
+                        s.current_nick = profile.nick.clone();
+                    }
+                    rebuild_nav(&mut self.nav, &self.servers);
+
+                    let (cmd_tx, msg_rx) = spawn_connection(idx, conn_cfg);
+                    self.cmd_txs.insert(idx, cmd_tx);
+                    self.msg_rx = Some(msg_rx);
+                }
             }
 
             Message::Disconnect(idx) => {
@@ -346,23 +383,15 @@ impl cosmic::Application for CosmicChat {
 
             Message::AddServerDialog => {
                 self.dialog_show = true;
-                self.dialog_server = ServerConfig {
-                    name: String::new(),
-                    host: "irc.libera.chat".into(),
-                    port: 6697,
-                    nick: "cosmic-user".into(),
-                    user: None,
-                    realname: None,
-                    password: None,
-                    use_tls: true,
-                    channels: vec!["#cosmic-chat".into()],
-                };
+                self.dialog_server = ServerConfig::default();
                 self.dialog_channels_str = "#cosmic-chat".into();
+                self.dialog_profile = "default".into();
             }
 
             Message::AddServer(cfg) => {
                 self.dialog_show = false;
                 let idx = self.config.servers.len();
+                let nick = self.config.resolve_profile(&cfg).nick.clone();
                 self.config.servers.push(cfg.clone());
                 self.config.save();
                 self.servers.push(ServerState {
@@ -370,7 +399,7 @@ impl cosmic::Application for CosmicChat {
                     name: cfg.name.clone(),
                     connection: ConnectionState::Disconnected,
                     channels: cfg.channels.clone(),
-                    current_nick: cfg.nick.clone(),
+                    current_nick: nick,
                 });
                 rebuild_nav(&mut self.nav, &self.servers);
             }
@@ -382,110 +411,123 @@ impl cosmic::Application for CosmicChat {
     }
 }
 
+// ── View helpers ────────────────────────────────────────────────────────────
+
 impl CosmicChat {
     fn view_welcome(&self) -> Element<'_, Message> {
-        let s = cosmic::theme::spacing();
+        let sp = cosmic::theme::spacing();
+
+        let server_count = self.config.servers.len();
+        let profile_count = self.config.profile.names().len();
+        let body = format!(
+            "Servers configured: {server_count}\nUser profiles: {profile_count}\n\nConnect to a server or add a new one."
+        );
 
         widget::column::with_capacity(4)
             .push(widget::text::title2("COSMIC Chat"))
-            .push(widget::text::body("Connect to an IRC server to get started."))
-            .push(space::vertical().height(s.space_m))
+            .push(widget::text::body(body))
+            .push(space::vertical().height(sp.space_m))
             .push(widget::button::suggested("+ Add Server").on_press(Message::AddServerDialog))
-            .spacing(s.space_s)
-            .padding(s.space_l)
+            .spacing(sp.space_s)
+            .padding(sp.space_l)
             .align_x(Alignment::Center)
             .into()
     }
 
     fn view_server(&self, idx: usize) -> Element<'_, Message> {
-        let s = cosmic::theme::spacing();
+        let sp = cosmic::theme::spacing();
 
         let server = match self.servers.get(idx) {
             Some(sv) => sv,
             None => return self.view_welcome(),
         };
 
+        let sc = self.config.servers.get(idx);
+        let profile_name = sc.map(|c| c.profile.as_str()).unwrap_or("default");
         let status = format!("{:?}", server.connection);
-        let nick = &server.current_nick;
 
         let mut ch_list = widget::column::with_capacity(server.channels.len() + 1);
         for ch in &server.channels {
             ch_list = ch_list.push(widget::text::body(format!("  # {ch}")));
         }
 
-        widget::column::with_capacity(6)
+        let is_connected = server.connection == ConnectionState::Connected;
+        let action_btn: Element<'_, Message> = if is_connected {
+            widget::button::standard("Disconnect")
+                .on_press(Message::Disconnect(idx))
+                .into()
+        } else {
+            widget::button::suggested("Connect")
+                .on_press(Message::Connect(idx))
+                .into()
+        };
+
+        widget::column::with_capacity(7)
             .push(widget::text::title3(&server.name))
-            .push(widget::text::caption(format!("Nick: {nick}  |  {status}")))
-            .push(space::vertical().height(s.space_m))
+            .push(widget::text::caption(format!(
+                "Nick: {}  |  Profile: {profile_name}  |  {status}",
+                server.current_nick,
+            )))
+            .push(space::vertical().height(sp.space_m))
             .push(widget::text::body("Channels:"))
-            .push(ch_list.spacing(s.space_xs))
-            .push(space::vertical().height(s.space_m))
-            .push({
-                let is_connected = server.connection == ConnectionState::Connected;
-                let btn: Element<'_, Message> = if is_connected {
-                    widget::button::standard("Disconnect")
-                        .on_press(Message::Disconnect(idx))
-                        .into()
-                } else {
-                    widget::button::suggested("Connect")
-                        .on_press(Message::Connect(idx))
-                        .into()
-                };
-                btn
-            })
-            .spacing(s.space_s)
-            .padding(s.space_m)
+            .push(ch_list.spacing(sp.space_xs))
+            .push(space::vertical().height(sp.space_m))
+            .push(action_btn)
+            .spacing(sp.space_s)
+            .padding(sp.space_m)
             .into()
     }
 
     fn view_channel(&self, server_idx: usize, channel: &str) -> Element<'_, Message> {
-        let s = cosmic::theme::spacing();
+        let sp = cosmic::theme::spacing();
+        let layout = &self.config.layout;
 
-        let msgs: Vec<&IrcMessage> = self
+        let mut msgs: Vec<&IrcMessage> = self
             .messages
             .iter()
             .filter(|m| m.server == server_idx && m.target == *channel)
             .collect();
 
+        // Apply max scrollback
+        if msgs.len() > layout.max_scrollback {
+            let skip = msgs.len() - layout.max_scrollback;
+            msgs = msgs[skip..].to_vec();
+        }
+
         let mut msg_col = widget::column::with_capacity(msgs.len().max(1)).spacing(2);
 
         if msgs.is_empty() {
-            msg_col = msg_col.push(
-                widget::text::body("No messages yet. Join the conversation!")
-            );
+            msg_col = msg_col.push(widget::text::body("No messages yet."));
         } else {
             for m in &msgs {
+                // Respect show_join_part setting
+                if !layout.show_join_part
+                    && matches!(m.kind, MessageKind::Join | MessageKind::Part | MessageKind::Quit)
+                {
+                    continue;
+                }
+
                 let display_text = match m.kind {
-                    MessageKind::Chat => {
-                        match &m.sender {
-                            Some(nick) => format!("<{nick}> {}", m.text),
-                            None => m.text.clone(),
-                        }
-                    }
-                    MessageKind::Action => {
-                        match &m.sender {
-                            Some(nick) => format!("* {nick} {}", m.text),
-                            None => format!("* {}", m.text),
-                        }
-                    }
-                    MessageKind::Join => {
-                        format!("→ {}", m.text)
-                    }
-                    MessageKind::Part | MessageKind::Quit => {
-                        format!("← {}", m.text)
-                    }
-                    MessageKind::Notice => {
-                        format!("[notice] {}", m.text)
-                    }
-                    MessageKind::Topic | MessageKind::Server => {
-                        m.text.clone()
-                    }
+                    MessageKind::Chat => match &m.sender {
+                        Some(nick) => format!("<{nick}> {}", m.text),
+                        None => m.text.clone(),
+                    },
+                    MessageKind::Action => match &m.sender {
+                        Some(nick) => format!("* {nick} {}", m.text),
+                        None => format!("* {}", m.text),
+                    },
+                    MessageKind::Join => format!("→ {}", m.text),
+                    MessageKind::Part | MessageKind::Quit => format!("← {}", m.text),
+                    MessageKind::Notice => format!("[notice] {}", m.text),
+                    MessageKind::Topic | MessageKind::Server => m.text.clone(),
                 };
 
-                let line = widget::row::with_capacity(2)
-                    .push(widget::text::caption(&m.time))
-                    .push(widget::text::body(display_text))
-                    .spacing(s.space_s);
+                let mut line = widget::row::with_capacity(2).spacing(sp.space_s);
+
+                if layout.show_timestamps {
+                    line = line.push(widget::text::caption(&m.time));
+                }
+                line = line.push(widget::text::body(display_text));
 
                 msg_col = msg_col.push(line);
             }
@@ -495,7 +537,7 @@ impl CosmicChat {
 
         widget::column::with_capacity(3)
             .push(widget::text::title4(format!("# {channel}")))
-            .push(space::vertical().height(s.space_s))
+            .push(space::vertical().height(sp.space_s))
             .push(scroll)
             .push(space::vertical().height(6))
             .push(
@@ -510,41 +552,57 @@ impl CosmicChat {
                         widget::button::suggested("Send")
                             .on_press(Message::SendMessage),
                     )
-                    .spacing(s.space_s)
+                    .spacing(sp.space_s)
                     .align_y(Alignment::Center),
             )
             .spacing(0)
-            .padding([s.space_s, s.space_m])
+            .padding([sp.space_s, sp.space_m])
             .into()
     }
 
     fn view_add_server_dialog(&self) -> Element<'_, Message> {
-        let s = cosmic::theme::spacing();
+        let sp = cosmic::theme::spacing();
 
-        widget::column::with_capacity(10)
+        widget::column::with_capacity(12)
             .push(widget::text::title3("Add IRC Server"))
-            .push(space::vertical().height(s.space_s))
+            .push(space::vertical().height(sp.space_s))
             .push(widget::text_input("Server name", &self.dialog_server.name)
                 .on_input(|_| Message::Noop))
-            .push(widget::text_input("Host (e.g. irc.libera.chat)", &self.dialog_server.host)
+            .push(widget::text_input("Host", &self.dialog_server.host)
                 .on_input(|_| Message::Noop))
-            .push(widget::text_input("Nickname", &self.dialog_server.nick)
+            .push(widget::text_input("Profile (user identity)", &self.dialog_profile)
                 .on_input(|_| Message::Noop))
             .push(widget::text_input("Channels (comma-separated)", &self.dialog_channels_str)
                 .on_input(|_| Message::Noop))
-            .push(space::vertical().height(s.space_m))
+            .push(widget::text::caption("Port: 6697 (TLS)  |  Auto-connect: yes"))
+            .push(space::vertical().height(sp.space_m))
             .push(
                 widget::row::with_capacity(2)
                     .push(widget::button::suggested("Add").on_press(
                         Message::AddServer(self.dialog_server.clone())
                     ))
                     .push(widget::button::standard("Cancel").on_press(Message::Noop))
-                    .spacing(s.space_s),
+                    .spacing(sp.space_s),
             )
-            .spacing(s.space_s)
-            .padding(s.space_l)
-            .width(400)
+            .spacing(sp.space_s)
+            .padding(sp.space_l)
+            .width(420)
             .into()
+    }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+fn build_connection_config(sc: &ServerConfig, profile: &UserProfile) -> ConnectionConfig {
+    ConnectionConfig {
+        host: sc.host.clone(),
+        port: sc.port,
+        tls: sc.tls,
+        nick: profile.nick.clone(),
+        user: profile.user.clone(),
+        realname: profile.realname.clone(),
+        password: sc.password.clone(),
+        channels: sc.channels.clone(),
     }
 }
 
