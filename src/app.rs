@@ -445,9 +445,27 @@ impl cosmic::Application for CosmicChat {
                     }
 
                 } else if let Some(NavItem::Channel(_, ch)) = &self.selected {
+                    // Local echo — show own message immediately
+                    let nick = self.servers.get(server_idx)
+                        .map(|s| s.current_nick.clone())
+                        .unwrap_or_else(|| "me".into());
+                    self.messages.push(IrcMessage {
+                        server: server_idx,
+                        target: ch.clone(),
+                        sender: Some(nick),
+                        text: text.clone(),
+                        kind: MessageKind::Chat,
+                        time: crate::irc_client::now_hhmmss(),
+                    });
                     if let Some(tx) = self.cmd_txs.get(&server_idx) {
+                        let text_copy = text.clone();
                         let _ = tx.send(IrcCommand::SendMsg(server_idx, ch.clone(), text));
+                        log::debug!("[app] Sent to {ch}: {text_copy}");
+                    } else {
+                        log::warn!("[app] No command sender for server {server_idx}");
                     }
+                } else {
+                    log::debug!("[app] Not on a channel — message dropped");
                 }
             }
 
