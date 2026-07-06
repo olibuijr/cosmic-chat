@@ -57,6 +57,12 @@ pub struct CosmicChat {
     dialog_channels_str: String,
     dialog_profile: String,
     dialog_show: bool,
+    /// Last message index we notified for (avoids re-notifying).
+    last_notified: usize,
+    /// Per-channel user lists: (server_idx, channel) -> sorted nicknames
+    channel_users: HashMap<(usize, String), Vec<String>>,
+    /// Per-channel topics: (server_idx, channel) -> topic text
+    channel_topics: HashMap<(usize, String), String>,
 }
 
 impl cosmic::Application for CosmicChat {
@@ -105,6 +111,9 @@ impl cosmic::Application for CosmicChat {
             dialog_channels_str: String::new(),
             dialog_profile: "default".into(),
             dialog_show: false,
+            channel_users: HashMap::new(),
+            channel_topics: HashMap::new(),
+            last_notified: 0,
         };
 
         (app, Task::none())
@@ -259,17 +268,81 @@ impl cosmic::Application for CosmicChat {
                 // Drain IRC messages
                 if let Some(ref mut rx) = self.msg_rx {
                     while let Ok(msg) = rx.try_recv() {
-                        if msg.kind == MessageKind::Join {
-                            if let Some(s) = self.servers.get_mut(msg.server) {
-                                if !s.channels.contains(&msg.target) {
-                                    s.channels.push(msg.target.clone());
-                                    s.channels.sort();
+                        let key = (msg.server, msg.target.clone());
+                        match msg.kind {
+                            MessageKind::Join => {
+                                // Track user
+                                if let Some(ref sender) = msg.sender {
+                                    self.channel_users
+                                        .entry(key.clone())
+                                        .or_default()
+                                        .push(sender.clone());
+                                }
+                                // Track channel
+                                if let Some(s) = self.servers.get_mut(msg.server) {
+                                    if !s.channels.contains(&msg.target) {
+                                        s.channels.push(msg.target.clone());
+                                        s.channels.sort();
+                                    }
                                 }
                             }
+                            MessageKind::Part | MessageKind::Quit => {
+                                if let Some(ref sender) = msg.sender {
+                                    if let Some(users) = self.channel_users.get_mut(&key) {
+                                        users.retain(|u| u != sender);
+                                    }
+                                }
+                            }
+                            MessageKind::Topic => {
+                                self.channel_topics.insert(key, msg.text.clone());
+                            }
+                            _ => {}
                         }
                         self.messages.push(msg);
                     }
                 }
+
+                // ── Notifications + sound ──────────────────────────
+                let layout = &self.config.layout;
+                let new_msgs = &self.messages[self.last_notified..];
+                for msg in new_msgs {
+                    // Only notify for incoming chat/action messages from others
+                    if matches!(msg.kind, MessageKind::Chat | MessageKind::Action) {
+                        if let Some(ref nick) = msg.sender {
+                            // Don't notify for our own messages
+                            let is_self = self.servers.get(msg.server)
+                                .map(|s| s.current_nick == *nick)
+                                .unwrap_or(false);
+                            if is_self { continue; }
+
+                            let channel = &msg.target;
+                            let body = {
+                                let s = nick;
+                                let t = &msg.text;
+                                if msg.kind == MessageKind::Action {
+                                    format!("* {s} {t}")
+                                } else {
+                                    format!("<{s}> {t}")
+                                }
+                            };
+
+                            if layout.notifications {
+                                let _ = std::process::Command::new("notify-send")
+                                    .args(["--app-name", "COSMIC Chat"])
+                                    .args(["--category", "im.received"])
+                                    .arg(format!("{channel}"))
+                                    .arg(&body)
+                                    .spawn();
+                            }
+                            if layout.sound {
+                                let _ = std::process::Command::new("paplay")
+                                    .arg("/usr/share/sounds/freedesktop/stereo/message-new-instant.oga")
+                                    .spawn();
+                            }
+                        }
+                    }
+                }
+                self.last_notified = self.messages.len();
 
                 // Auto-connect servers on first tick
                 let auto_connect: Vec<usize> = self.config
@@ -501,81 +574,150 @@ impl CosmicChat {
         let sp = cosmic::theme::spacing();
         let layout = &self.config.layout;
 
+        let key = (server_idx, channel.to_string());
+
+        // ── Topic bar ──────────────────────────────────────────────────
+        let topic_text = self.channel_topics.get(&key).cloned().unwrap_or_default();
+        let topic_bar = widget::container(
+            if topic_text.is_empty() {
+                widget::text::caption("No topic set")
+            } else {
+                widget::text::caption(format!("Topic: {topic_text}"))
+            }
+        )
+        .width(Length::Fill)
+        .padding([2, 8]);
+
+        // ── Message area ───────────────────────────────────────────────
         let mut msgs: Vec<&IrcMessage> = self
             .messages
             .iter()
             .filter(|m| m.server == server_idx && m.target == *channel)
             .collect();
 
-        // Apply max scrollback
         if msgs.len() > layout.max_scrollback {
             let skip = msgs.len() - layout.max_scrollback;
             msgs = msgs[skip..].to_vec();
         }
 
-        let mut msg_col = widget::column::with_capacity(msgs.len().max(1)).spacing(2);
+        let mut msg_col = widget::column::with_capacity(msgs.len().max(1)).spacing(1);
 
         if msgs.is_empty() {
-            msg_col = msg_col.push(widget::text::body("No messages yet."));
+            msg_col = msg_col.push(widget::text::body("— end of /MOTD —"));
         } else {
             for m in &msgs {
-                // Respect show_join_part setting
                 if !layout.show_join_part
                     && matches!(m.kind, MessageKind::Join | MessageKind::Part | MessageKind::Quit)
                 {
                     continue;
                 }
 
-                let display_text = match m.kind {
-                    MessageKind::Chat => match &m.sender {
-                        Some(nick) => format!("<{nick}> {}", m.text),
-                        None => m.text.clone(),
-                    },
-                    MessageKind::Action => match &m.sender {
-                        Some(nick) => format!("* {nick} {}", m.text),
-                        None => format!("* {}", m.text),
-                    },
-                    MessageKind::Join => format!("→ {}", m.text),
-                    MessageKind::Part | MessageKind::Quit => format!("← {}", m.text),
-                    MessageKind::Notice => format!("[notice] {}", m.text),
-                    MessageKind::Topic | MessageKind::Server => m.text.clone(),
+                // Build IRC-style line: [HH:MM] <nick> message
+                let ts = if layout.show_timestamps {
+                    format!("[{}]", &m.time[..5.min(m.time.len())])
+                } else {
+                    String::new()
                 };
 
-                let mut line = widget::row::with_capacity(2).spacing(sp.space_s);
+                let (prefix, body, is_event) = match m.kind {
+                    MessageKind::Chat => {
+                        let nick = m.sender.as_deref().unwrap_or("?");
+                        (format!("<{nick}>"), m.text.clone(), false)
+                    }
+                    MessageKind::Action => {
+                        let nick = m.sender.as_deref().unwrap_or("?");
+                        (format!("* {nick}"), m.text.clone(), false)
+                    }
+                    MessageKind::Join => (String::new(), format!("→ {}", m.text), true),
+                    MessageKind::Part => (String::new(), format!("← {}", m.text), true),
+                    MessageKind::Quit => (String::new(), format!("← {}", m.text), true),
+                    MessageKind::Notice => { let t = &m.text; (String::new(), format!("— {t}"), true) },
+                    MessageKind::Topic => { let t = &m.text; (String::new(), format!("— {t}"), true) },
+                    MessageKind::Server => { let t = &m.text; (String::new(), format!("— {t}"), true) },
+                };
 
-                if layout.show_timestamps {
-                    line = line.push(widget::text::caption(&m.time));
-                }
-                line = line.push(widget::text::body(display_text));
+                let element: Element<'_, Message> = if is_event {
+                    widget::row::with_capacity(2)
+                        .push(widget::text::caption(ts))
+                        .push(widget::text::body(body))
+                        .spacing(sp.space_xs)
+                        .into()
+                } else {
+                    widget::row::with_capacity(3)
+                        .push(widget::text::caption(ts))
+                        .push(widget::text::body(prefix))
+                        .push(widget::text::body(body))
+                        .spacing(sp.space_xs)
+                        .into()
+                };
 
-                msg_col = msg_col.push(line);
+                msg_col = msg_col.push(element);
             }
         }
 
-        let scroll = widget::scrollable(msg_col).width(Length::Fill);
+        let scroll = widget::scrollable(msg_col)
+            .width(Length::Fill)
+            .height(Length::Fill);
 
-        widget::column::with_capacity(3)
-            .push(widget::text::title4(format!("# {channel}")))
-            .push(space::vertical().height(sp.space_s))
-            .push(scroll)
-            .push(space::vertical().height(6))
+        // ── User list ──────────────────────────────────────────────────
+        let users = self.channel_users.get(&key);
+        let user_count = users.map(|u| u.len()).unwrap_or(0);
+        let mut user_col = widget::column::with_capacity(user_count.max(1)).spacing(1);
+
+        user_col = user_col.push(
+            widget::text::caption(format!("Users ({user_count})"))
+        );
+
+        if let Some(ulist) = users {
+            for nick in ulist {
+                user_col = user_col.push(widget::text::body(nick.clone()));
+            }
+        }
+
+        let user_panel = widget::scrollable(user_col)
+            .width(Length::Fixed(140.0))
+            .height(Length::Fill);
+
+        // ── Input bar ──────────────────────────────────────────────────
+        let input_bar = widget::row::with_capacity(2)
+            .push({
+                widget::text_input("Type a message or /command...", &self.input)
+                    .on_input(Message::InputChanged)
+                    .on_submit(|_| Message::SendMessage)
+                    .width(Length::Fill)
+            })
             .push(
-                widget::row::with_capacity(2)
-                    .push({
-                        widget::text_input("Type a message...", &self.input)
-                            .on_input(Message::InputChanged)
-                            .on_submit(|_| Message::SendMessage)
-                            .width(Length::Fill)
-                    })
-                    .push(
-                        widget::button::suggested("Send")
-                            .on_press(Message::SendMessage),
-                    )
-                    .spacing(sp.space_s)
-                    .align_y(Alignment::Center),
+                widget::button::suggested("Send")
+                    .on_press(Message::SendMessage),
+            )
+            .spacing(sp.space_s)
+            .align_y(Alignment::Center);
+
+        // ── Assemble layout ────────────────────────────────────────────
+        // Header: channel name + topic bar
+        let header = widget::column::with_capacity(2)
+            .push(
+                widget::container(widget::text::title4(format!("# {channel}")))
+                    .padding([2, 8])
+            )
+            .push(topic_bar)
+            .spacing(0);
+
+        // Body: message area + user list
+        let body = widget::row::with_capacity(2)
+            .push(scroll)
+            .push(user_panel)
+            .spacing(2);
+
+        // Full layout
+        widget::column::with_capacity(3)
+            .push(header)
+            .push(body)
+            .push(
+                widget::container(input_bar)
+                    .padding([4, 8])
             )
             .spacing(0)
-            .padding([sp.space_s, sp.space_m])
             .into()
     }
 

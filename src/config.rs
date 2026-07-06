@@ -160,6 +160,12 @@ pub struct LayoutConfig {
     /// Maximum messages to keep in scrollback per channel.
     #[serde(default = "default_scrollback")]
     pub max_scrollback: usize,
+    /// Enable desktop notifications for new messages.
+    #[serde(default = "default_true")]
+    pub notifications: bool,
+    /// Play a sound on new messages.
+    #[serde(default = "default_true")]
+    pub sound: bool,
 }
 
 fn default_sidebar_width() -> u16 {
@@ -187,6 +193,8 @@ impl Default for LayoutConfig {
             show_join_part: default_true(),
             show_timestamps: default_true(),
             max_scrollback: default_scrollback(),
+            notifications: true,
+            sound: true,
         }
     }
 }
