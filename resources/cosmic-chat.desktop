@@ -2,9 +2,10 @@
 Name=COSMIC Chat
 Comment=IRC client for the COSMIC desktop
 Exec=cosmic-chat
-Icon=cosmic-chat
+Icon=com.cosmic.Chat
 Type=Application
 Categories=Network;IRCClient;Chat;
 Terminal=false
 StartupNotify=true
+StartupWMClass=com.cosmic.Chat
 Keywords=irc;chat;messaging;cosmic;

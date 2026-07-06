@@ -40,12 +40,12 @@ echo ""
 echo "=== Installing ==="
 mkdir -p ~/.local/bin ~/.local/share/icons/hicolor/scalable/apps ~/.local/share/applications
 cp "$SRC"     ~/.local/bin/$BINARY
-cp "$ICON"    ~/.local/share/icons/hicolor/scalable/apps/$BINARY.svg
-cp "$DESKTOP" ~/.local/share/applications/$BINARY.desktop
+cp "$ICON"    ~/.local/share/icons/hicolor/scalable/apps/com.cosmic.Chat.svg
+cp "$DESKTOP" ~/.local/share/applications/com.cosmic.Chat.desktop
 update-desktop-database ~/.local/share/applications 2>/dev/null || true
 
 echo "  binary     -> ~/.local/bin/$BINARY"
-echo "  icon       -> ~/.local/share/icons/hicolor/scalable/apps/$BINARY.svg"
-echo "  desktop    -> ~/.local/share/applications/$BINARY.desktop"
+echo "  icon       -> ~/.local/share/icons/hicolor/scalable/apps/com.cosmic.Chat.svg"
+echo "  desktop    -> ~/.local/share/applications/com.cosmic.Chat.desktop"
 echo ""
 echo "=== Done: $BINARY v$VERSION installed ==="
