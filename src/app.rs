@@ -48,7 +48,7 @@ pub struct CosmicChat {
     config: Config,
     servers: Vec<ServerState>,
     cmd_txs: HashMap<usize, mpsc::UnboundedSender<IrcCommand>>,
-    msg_rx: Option<mpsc::UnboundedReceiver<IrcMessage>>,
+    msg_rxs: HashMap<usize, mpsc::UnboundedReceiver<IrcMessage>>,
     messages: Vec<IrcMessage>,
     selected: Option<NavItem>,
     input: String,
@@ -102,7 +102,7 @@ impl cosmic::Application for CosmicChat {
             config,
             servers,
             cmd_txs: HashMap::new(),
-            msg_rx: None,
+            msg_rxs: HashMap::new(),
             messages: Vec::new(),
             selected: None,
             input: String::new(),
@@ -265,41 +265,54 @@ impl cosmic::Application for CosmicChat {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Tick => {
-                // Drain IRC messages
-                if let Some(ref mut rx) = self.msg_rx {
+                // Drain IRC messages from all receivers
+                let mut all_msgs: Vec<IrcMessage> = Vec::new();
+                for rx in self.msg_rxs.values_mut() {
                     while let Ok(msg) = rx.try_recv() {
-                        let key = (msg.server, msg.target.clone());
-                        match msg.kind {
-                            MessageKind::Join => {
-                                // Track user
-                                if let Some(ref sender) = msg.sender {
-                                    self.channel_users
-                                        .entry(key.clone())
-                                        .or_default()
-                                        .push(sender.clone());
-                                }
-                                // Track channel
-                                if let Some(s) = self.servers.get_mut(msg.server) {
-                                    if !s.channels.contains(&msg.target) {
-                                        s.channels.push(msg.target.clone());
-                                        s.channels.sort();
-                                    }
-                                }
-                            }
-                            MessageKind::Part | MessageKind::Quit => {
-                                if let Some(ref sender) = msg.sender {
-                                    if let Some(users) = self.channel_users.get_mut(&key) {
-                                        users.retain(|u| u != sender);
-                                    }
-                                }
-                            }
-                            MessageKind::Topic => {
-                                self.channel_topics.insert(key, msg.text.clone());
-                            }
-                            _ => {}
-                        }
-                        self.messages.push(msg);
+                        all_msgs.push(msg);
                     }
+                }
+                for msg in all_msgs {
+                    let key = (msg.server, msg.target.clone());
+                    match msg.kind {
+                        MessageKind::Join => {
+                            if let Some(ref sender) = msg.sender {
+                                let users = self.channel_users.entry(key.clone()).or_default();
+                                if !users.contains(sender) {
+                                    users.push(sender.clone());
+                                    users.sort();
+                                }
+                                log::debug!("[app] JOIN {} -> {}", sender, msg.target);
+                            }
+                            if let Some(s) = self.servers.get_mut(msg.server) {
+                                if !msg.target.is_empty() && !s.channels.contains(&msg.target) {
+                                    s.channels.push(msg.target.clone());
+                                    s.channels.sort();
+                                    rebuild_nav(&mut self.nav, &self.servers);
+                                }
+                            }
+                        }
+                        MessageKind::Part | MessageKind::Quit => {
+                            if let Some(ref sender) = msg.sender {
+                                if let Some(users) = self.channel_users.get_mut(&key) {
+                                    users.retain(|u| u != sender);
+                                }
+                            }
+                        }
+                        MessageKind::Topic => {
+                            self.channel_topics.insert(key, msg.text.clone());
+                        }
+                        MessageKind::NamesReply => {
+                            let nicks: Vec<String> = msg.text.split(',')
+                                .filter(|n| !n.is_empty())
+                                .map(|n| n.to_string())
+                                .collect();
+                            log::info!("[app] NAMES {}: {} users", msg.target, nicks.len());
+                            self.channel_users.insert(key, nicks);
+                        }
+                        _ => {}
+                    }
+                    self.messages.push(msg);
                 }
 
                 // ── Notifications + sound ──────────────────────────
@@ -363,9 +376,10 @@ impl cosmic::Application for CosmicChat {
                     }
                     rebuild_nav(&mut self.nav, &self.servers);
 
+                    log::info!("[app] Connecting to {} ({})", sc.name, sc.host);
                     let (cmd_tx, msg_rx) = spawn_connection(idx, conn_cfg);
                     self.cmd_txs.insert(idx, cmd_tx);
-                    self.msg_rx = Some(msg_rx);
+                    self.msg_rxs.insert(idx, msg_rx);
                 }
 
                 // Mark servers as Connected when we see the "Connected" message
@@ -412,6 +426,7 @@ impl cosmic::Application for CosmicChat {
                     None => return Task::none(),
                 };
 
+                log::debug!("[app] Input: {text}");
                 if text.starts_with('/') {
                     let current_ch = match &self.selected {
                         Some(NavItem::Channel(_, ch)) => Some(ch.clone()),
@@ -456,14 +471,17 @@ impl cosmic::Application for CosmicChat {
                     }
                     rebuild_nav(&mut self.nav, &self.servers);
 
+                    log::info!("[app] Connecting to {} ({})", sc.name, sc.host);
                     let (cmd_tx, msg_rx) = spawn_connection(idx, conn_cfg);
                     self.cmd_txs.insert(idx, cmd_tx);
-                    self.msg_rx = Some(msg_rx);
+                    self.msg_rxs.insert(idx, msg_rx);
                 }
             }
 
             Message::Disconnect(idx) => {
+                log::info!("[app] Disconnecting server {idx}");
                 self.cmd_txs.remove(&idx);
+                self.msg_rxs.remove(&idx);
                 if let Some(tx) = self.cmd_txs.get(&idx) {
                     let _ = tx.send(IrcCommand::Disconnect);
                 }
@@ -633,6 +651,7 @@ impl CosmicChat {
                     MessageKind::Quit => (String::new(), format!("← {}", m.text), true),
                     MessageKind::Notice => { let t = &m.text; (String::new(), format!("— {t}"), true) },
                     MessageKind::Topic => { let t = &m.text; (String::new(), format!("— {t}"), true) },
+                    MessageKind::NamesReply => { continue; },
                     MessageKind::Server => { let t = &m.text; (String::new(), format!("— {t}"), true) },
                 };
 

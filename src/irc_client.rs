@@ -39,6 +39,7 @@ pub enum MessageKind {
     Part,
     Quit,
     Topic,
+    NamesReply,
     Server,
 }
 
@@ -97,8 +98,12 @@ async fn run_connection(
     msg_tx: &mpsc::UnboundedSender<IrcMessage>,
     mut cmd_rx: mpsc::UnboundedReceiver<IrcCommand>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let alt_nicks: Vec<String> = (1..5)
+        .map(|i| format!("{}_", cfg.nick) + &i.to_string())
+        .collect();
     let irc_config = Config {
         nickname: Some(cfg.nick.clone()),
+        alt_nicks: alt_nicks,
         username: cfg.user.clone(),
         realname: cfg.realname.clone(),
         server: Some(cfg.host.clone()),
@@ -113,6 +118,7 @@ async fn run_connection(
     client.identify()?;
 
     let nick = client.current_nickname().to_string();
+    log::info!("[irc:{idx}] Connected as {nick} to {}:{}", cfg.host, cfg.port);
     let _ = msg_tx.send(server_msg(idx, &format!("Connected as {nick}")));
 
     let sender = client.sender();
@@ -122,17 +128,21 @@ async fn run_connection(
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
-                IrcCommand::Join(_, ch) => {
-                    let _ = sender.send_join(&ch);
+                IrcCommand::Join(_, ref ch) => {
+                    log::debug!("[irc:{idx}] Sending JOIN {ch}");
+                    let _ = sender.send_join(ch);
                 }
-                IrcCommand::Part(_, ch) => {
-                    let _ = sender.send_part(&ch);
+                IrcCommand::Part(_, ref ch) => {
+                    log::debug!("[irc:{idx}] Sending PART {ch}");
+                    let _ = sender.send_part(ch);
                 }
-                IrcCommand::SendMsg(_, target, text) => {
-                    let _ = sender.send_privmsg(&target, &text);
+                IrcCommand::SendMsg(_, ref target, ref text) => {
+                    log::debug!("[irc:{idx}] PRIVMSG {target}: {text}");
+                    let _ = sender.send_privmsg(target, text);
                 }
-                IrcCommand::SendAction(_, target, text) => {
-                    let _ = sender.send_action(&target, &text);
+                IrcCommand::SendAction(_, ref target, ref text) => {
+                    log::debug!("[irc:{idx}] ACTION {target}: {text}");
+                    let _ = sender.send_action(target, text);
                 }
                 IrcCommand::Nick(_, new_nick) => {
                     let _ = sender.send(Command::NICK(new_nick));
@@ -153,16 +163,19 @@ async fn run_connection(
         match message {
             Ok(msg) => {
                 if let Some(irc_msg) = parse_message(idx, &msg) {
+                    log::trace!("[irc:{idx}] <- {:?} {}: {}", irc_msg.kind, irc_msg.target, irc_msg.text);
                     let _ = msg_tx.send(irc_msg);
                 }
             }
-            Err(_) => {
+            Err(e) => {
+                log::warn!("[irc:{idx}] Stream error: {e}");
                 let _ = msg_tx.send(server_msg(idx, "Connection error"));
                 break;
             }
         }
     }
 
+    log::info!("[irc:{idx}] Stream ended, sending Disconnected");
     let _ = msg_tx.send(server_msg(idx, "Disconnected"));
     Ok(())
 }
@@ -236,6 +249,31 @@ fn parse_message(idx: usize, msg: &Message) -> Option<IrcMessage> {
                 },
                 ch.clone(),
             )
+        }
+        Command::Response(ref resp, ref args) => {
+            // RPL_NAMREPLY = 353: :server 353 nick = #channel :nick1 @nick2
+            // args: [nick, "=", "#channel", "nick1 @nick2"]
+            if resp == &irc::proto::response::Response::RPL_NAMREPLY
+                && args.len() >= 4
+            {
+                let ch = args[2].clone();
+                let nicks_str = &args[3];
+                // Build user list from space-separated nicks, stripping prefixes
+                let nicks: Vec<String> = nicks_str
+                    .split(' ')
+                    .filter(|n| !n.is_empty())
+                    .map(|n| n.trim_start_matches(&['@', '+', '%', '&', '~']).to_string())
+                    .collect();
+                log::debug!("[irc:{idx}] NAMES {ch}: {} users", nicks.len());
+                (
+                    MessageKind::NamesReply,
+                    None,
+                    nicks.join(","),
+                    ch,
+                )
+            } else {
+                return None;
+            }
         }
         _ => return None,
     };
