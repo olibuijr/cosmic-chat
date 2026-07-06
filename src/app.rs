@@ -8,8 +8,8 @@ use tokio::sync::mpsc;
 
 use crate::config::{Config, ServerConfig, UserProfile};
 use crate::irc_client::{
-    ConnectionConfig, ConnectionState, IrcCommand, IrcMessage, MessageKind, ServerState,
-    spawn_connection,
+    ConnectionConfig, ConnectionState, IrcCommand, IrcMessage, MessageKind,
+    ServerState, spawn_connection,
 };
 
 // ── Messages ────────────────────────────────────────────────────────────────
@@ -333,13 +333,32 @@ impl cosmic::Application for CosmicChat {
                 }
                 self.input.clear();
 
-                if let Some(NavItem::Channel(server_idx, channel)) = &self.selected {
-                    if let Some(tx) = self.cmd_txs.get(server_idx) {
-                        let _ = tx.send(IrcCommand::SendMsg(
-                            *server_idx,
-                            channel.clone(),
-                            text,
-                        ));
+                // Determine server index from current selection
+                let server_idx = match &self.selected {
+                    Some(NavItem::Server(i)) | Some(NavItem::Channel(i, _)) => *i,
+                    None => return Task::none(),
+                };
+
+                if text.starts_with('/') {
+                    let current_ch = match &self.selected {
+                        Some(NavItem::Channel(_, ch)) => Some(ch.clone()),
+                        _ => None,
+                    };
+                    let new_selection = handle_slash_command(
+                        server_idx,
+                        &text,
+                        current_ch,
+                        &mut self.messages,
+                        &mut self.cmd_txs,
+                        &mut self.servers,
+                    );
+                    if let Some(ns) = new_selection {
+                        self.selected = Some(ns);
+                    }
+
+                } else if let Some(NavItem::Channel(_, ch)) = &self.selected {
+                    if let Some(tx) = self.cmd_txs.get(&server_idx) {
+                        let _ = tx.send(IrcCommand::SendMsg(server_idx, ch.clone(), text));
                     }
                 }
             }
@@ -605,6 +624,177 @@ fn build_connection_config(sc: &ServerConfig, profile: &UserProfile) -> Connecti
         channels: sc.channels.clone(),
     }
 }
+
+fn handle_slash_command(
+    server_idx: usize,
+    text: &str,
+    current_channel: Option<String>,
+    messages: &mut Vec<IrcMessage>,
+    cmd_txs: &mut HashMap<usize, mpsc::UnboundedSender<IrcCommand>>,
+    servers: &mut Vec<ServerState>,
+) -> Option<NavItem> {
+    let body = &text[1..]; // strip leading /
+    let mut parts = body.splitn(3, ' ');
+    let cmd = parts.next().unwrap_or("").to_lowercase();
+    let arg1 = parts.next().map(|s| s.to_string()).unwrap_or_default();
+    let arg2 = parts.next().map(|s| s.to_string()).unwrap_or_default();
+
+    let local_echo = |messages: &mut Vec<IrcMessage>, text: &str| {
+        messages.push(IrcMessage {
+            server: server_idx,
+            target: String::new(),
+            sender: None,
+            text: text.to_string(),
+            kind: MessageKind::Server,
+            time: crate::irc_client::now_hhmmss(),
+        });
+    };
+
+    match cmd.as_str() {
+        "join" | "j" => {
+            if arg1.is_empty() {
+                local_echo(messages, "Usage: /join #channel");
+                return None;
+            }
+            if let Some(tx) = cmd_txs.get(&server_idx) {
+                let _ = tx.send(IrcCommand::Join(server_idx, arg1.clone()));
+                local_echo(messages, &format!("Joining {arg1}…"));
+            }
+        }
+
+        "part" | "leave" => {
+            let ch = if arg1.starts_with('#') {
+                arg1.clone()
+            } else if let Some(ref ch) = current_channel {
+                ch.clone()
+            } else {
+                local_echo(messages, "Usage: /part [#channel] [reason]");
+                return None;
+            };
+            if let Some(tx) = cmd_txs.get(&server_idx) {
+                let _ = tx.send(IrcCommand::Part(server_idx, ch.clone()));
+                local_echo(messages, &format!("Leaving {ch}"));
+            }
+            // Clear selection if leaving current channel
+            return None;
+        }
+
+        "quit" | "disconnect" => {
+            if let Some(tx) = cmd_txs.get(&server_idx) {
+                let _ = tx.send(IrcCommand::Disconnect);
+            }
+            cmd_txs.remove(&server_idx);
+            if let Some(s) = servers.get_mut(server_idx) {
+                s.connection = ConnectionState::Disconnected;
+            }
+            local_echo(messages, "Disconnected");
+            return None;
+        }
+
+        "me" => {
+            let action_text = if arg2.is_empty() {
+                arg1.clone()
+            } else {
+                format!("{arg1} {arg2}")
+            };
+            if action_text.is_empty() {
+                local_echo(messages, "Usage: /me <action>");
+                return None;
+            }
+            // Figure out target — current channel or arg1 if it looks like a nick
+            let target = if let Some(ref ch) = current_channel {
+                ch.clone()
+            } else {
+                local_echo(messages, "Select a channel first for /me");
+                return None;
+            };
+            if let Some(tx) = cmd_txs.get(&server_idx) {
+                let _ = tx.send(IrcCommand::SendAction(server_idx, target, action_text));
+            }
+        }
+
+        "msg" | "query" => {
+            if arg1.is_empty() || arg2.is_empty() {
+                local_echo(messages, "Usage: /msg <nick> <message>");
+                return None;
+            }
+            if let Some(tx) = cmd_txs.get(&server_idx) {
+                let _ = tx.send(IrcCommand::SendMsg(server_idx, arg1.clone(), arg2.clone()));
+            }
+            local_echo(messages, &format!("-> *{arg1}* {arg2}"));
+        }
+
+        "nick" => {
+            if arg1.is_empty() {
+                local_echo(messages, "Usage: /nick <newnick>");
+                return None;
+            }
+            if let Some(tx) = cmd_txs.get(&server_idx) {
+                let _ = tx.send(IrcCommand::Nick(server_idx, arg1.clone()));
+            }
+            if let Some(s) = servers.get_mut(server_idx) {
+                s.current_nick = arg1.clone();
+            }
+            local_echo(messages, &format!("Changing nick to {arg1}…"));
+        }
+
+        "topic" => {
+            let ch = if arg1.starts_with('#') {
+                let topic = arg2;
+                if let Some(tx) = cmd_txs.get(&server_idx) {
+                    let _ = tx.send(IrcCommand::Raw(server_idx, format!("TOPIC {arg1} :{topic}")));
+                }
+                return None;
+            } else if let Some(ref ch) = current_channel {
+                ch.clone()
+            } else {
+                local_echo(messages, "Usage: /topic [#channel] [new topic]");
+                return None;
+            };
+            let topic = format!("{arg1} {arg2}").trim().to_string();
+            if topic.is_empty() {
+                // View topic
+                if let Some(tx) = cmd_txs.get(&server_idx) {
+                    let _ = tx.send(IrcCommand::Raw(server_idx, format!("TOPIC {ch}")));
+                }
+            } else {
+                if let Some(tx) = cmd_txs.get(&server_idx) {
+                    let _ = tx.send(IrcCommand::Raw(server_idx, format!("TOPIC {arg1} :{topic}")));
+                }
+            }
+        }
+
+        "whois" => {
+            if arg1.is_empty() {
+                local_echo(messages, "Usage: /whois <nick>");
+                return None;
+            }
+            if let Some(tx) = cmd_txs.get(&server_idx) {
+                let _ = tx.send(IrcCommand::Raw(server_idx, format!("WHOIS {arg1}")));
+            }
+        }
+
+        "raw" | "quote" => {
+            let raw = format!("{arg1} {arg2}").trim().to_string();
+            if raw.is_empty() {
+                local_echo(messages, "Usage: /raw <irc command>");
+                return None;
+            }
+            if let Some(tx) = cmd_txs.get(&server_idx) {
+                let _ = tx.send(IrcCommand::Raw(server_idx, raw.clone()));
+            }
+            local_echo(messages, &format!("-> {raw}"));
+        }
+
+        _ => {
+            local_echo(messages, &format!("Unknown command: /{cmd}"));
+        }
+    }
+
+    // Keep selection unchanged for most commands
+    current_channel.map(|ch| NavItem::Channel(server_idx, ch))
+}
+
 
 fn rebuild_nav(nav: &mut nav_bar::Model, servers: &[ServerState]) {
     *nav = nav_bar::Model::default();

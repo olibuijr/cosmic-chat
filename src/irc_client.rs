@@ -56,6 +56,8 @@ pub enum IrcCommand {
     Part(usize, String),
     SendMsg(usize, String, String),
     SendAction(usize, String, String),
+    Nick(usize, String),
+    Raw(usize, String),
     Disconnect,
 }
 
@@ -131,6 +133,12 @@ async fn run_connection(
                 }
                 IrcCommand::SendAction(_, target, text) => {
                     let _ = sender.send_action(&target, &text);
+                }
+                IrcCommand::Nick(_, new_nick) => {
+                    let _ = sender.send(Command::NICK(new_nick));
+                }
+                IrcCommand::Raw(_, raw) => {
+                    let _ = sender.send(raw.as_str());
                 }
                 IrcCommand::Disconnect => {
                     let _ = sender.send_quit("COSMIC Chat signed off");
@@ -253,7 +261,7 @@ fn server_msg(idx: usize, text: &str) -> IrcMessage {
     }
 }
 
-fn now_hhmmss() -> String {
+pub fn now_hhmmss() -> String {
     let t = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
